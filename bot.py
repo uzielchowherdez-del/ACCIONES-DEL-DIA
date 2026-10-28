@@ -7,7 +7,7 @@ import warnings; warnings.filterwarnings('ignore')
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
+  
 def send_telegram(text):
     if TELEGRAM_TOKEN and CHAT_ID:
         try:
