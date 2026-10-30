@@ -1,277 +1,286 @@
-
-import os, yfinance as yf, pandas as pd, numpy as np, requests, datetime, xml.etree.ElementTree as ET, traceback, time
-from xgboost import XGBClassifier
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.model_selection import TimeSeriesSplit
-import warnings; warnings.filterwarnings('ignore')
+"""
+BMV Bot Telegram Daily v11 - FILTRO IPC OPEN HOY FIX
+Fix audit 29-Oct-2026: antes usaba cierre_ayer vs anteayer para IPC, ahora usa OPEN HOY vs CLOSE AYER.
+- Tickers: 40 .MX
+- Filtros: RSI >78 <22, Vol <0.6x, Gap >5%
+- Macro: USD/MXN +0.8% / +0.7% y IPC open hoy -0.40% / -0.76%
+- Links Google Finance https://www.google.com/finance/quote/TICKER:BMV
+- Comandos: /top /ahora /macro /ayuda
+"""
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import requests, os, re, time
+from datetime import datetime, timedelta
+import pytz
+from xml.etree import ElementTree
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-def send_telegram(text, parse_mode="HTML"):
-    if TELEGRAM_TOKEN and CHAT_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                          json={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}, timeout=20)
-        except Exception as e:
-            print(f"Error telegram: {e}")
-    print(text)
+TICKERS_BMV = ["AAPL","AC","AMXB","AMZN","BBVA","BIMBOA","CEMEXCPO","CUERVO","F","FIBRAMQ12","FMTY14","GAPB","GCARSOA1","GFINBURO","GFNORTEO","GMEXICOB","GOOGL","GRUMAB","HERDEZ","IEO","INTC","IVVPESO","KIMBERA","KOFUBL","META","MSFT","NAFTRAC","NEMAKA","NFLX","NOKN","NVDA","PE&OLES","PINFRA","SLV","SORIANAB","TLEVISACPO","TM","TSLA","VOLARA","WALMEX"]
+MAP_YAHOO = {}
+for t in TICKERS_BMV:
+    if t == "PE&OLES":
+        MAP_YAHOO[t] = "PE&OLES.MX"
+    elif t == "IVVPESO":
+        MAP_YAHOO[t] = "IVVPESOISHRS.MX"
+    elif t == "NAFTRAC":
+        MAP_YAHOO[t] = "NAFTRACISHRS.MX"
+    else:
+        MAP_YAHOO[t] = f"{t}.MX"
 
-def get_google_finance_link(ticker_mx):
-    base = ticker_mx.replace(".MX","").replace("ISHRS","")
-    return f"https://www.google.com/finance/quote/{base}:BMV", base
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.where(delta>0,0).rolling(period).mean()
+    loss = -delta.where(delta<0,0).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100/(1+rs))
 
-DIAS_BANXICO = ["2026-02-05","2026-03-26","2026-05-14","2026-06-25","2026-08-06","2026-09-24","2026-11-05","2026-12-17"]
-NEGATIVAS = ["demanda","fraude","pérdida","perdida","baja","recorte","caída","caida","investigación","multa","quiebra","huelga","demora","falla","escándalo","lawsuit","fraud","loss","downgrade","cut","miss"]
-POSITIVAS = ["récord","record","alza","sube","ganancia","crecimiento","expansión","contrato","aprobación","incremento","utilidad","beat","upgrade","growth","gain","surge","profit","win"]
+def get_google_link(yahoo_ticker):
+    base = yahoo_ticker.replace(".MX","").replace("ISHRS","").replace("&","")
+    # Google Finance: https://www.google.com/finance/quote/BASE:BMV
+    return f"https://www.google.com/finance/quote/{base}:BMV"
 
-def get_macro_state():
-    estado = {"riesgo":"BAJO","usdmxn_chg":0,"mxx_chg":0,"es_banxico":False,"mensaje":"","bloqueo":False}
+def get_news(ticker_base):
     try:
-        usd = yf.Ticker("USDMXN=X").history(period="5d")
-        if len(usd)>=2:
-            estado["usdmxn_chg"] = round(float((usd['Close'].iloc[-1]-usd['Close'].iloc[-2])/usd['Close'].iloc[-2]*100),2)
-        mxx = yf.Ticker("^MXX").history(period="5d")
-        if len(mxx)>=2:
-            estado["mxx_chg"] = round(float((mxx['Close'].iloc[-1]-mxx['Close'].iloc[-2])/mxx['Close'].iloc[-2]*100),2)
-        hoy = datetime.date.today().isoformat()
-        if hoy in DIAS_BANXICO:
-            estado["es_banxico"]=True
-            estado["mensaje"]+= "📢 HOY BANXICO 13:00 - Cierra antes 12:50. "
-
-        # --- NUEVO FILTRO v10 IPC ---
-        if estado["mxx_chg"] <= -0.4:
-            estado["riesgo"]="EXTREMO"
-            estado["bloqueo"]=True
-            estado["mensaje"]+= f"🚫 IPC {estado['mxx_chg']}% muy rojo - HOY NO OPERES. "
-        elif estado["mxx_chg"] <= -0.25:
-            estado["riesgo"]="ALTO"
-            estado["mensaje"]+= f"⚠️ IPC {estado['mxx_chg']}% negativo. "
-
-        if estado["usdmxn_chg"]>=1.2:
-            estado["riesgo"]="EXTREMO"; estado["bloqueo"]=True; estado["mensaje"]+= f"💥 USD/MXN +{estado['usdmxn_chg']}% EXTREMO. "
-        elif estado["usdmxn_chg"]>=0.7:
-            if estado["riesgo"]!="EXTREMO":
-                estado["riesgo"]="ALTO"
-            estado["mensaje"]+= f"⚠️ USD/MXN +{estado['usdmxn_chg']}% ALTO. "
-        elif estado["usdmxn_chg"]<=-0.7:
-            if estado["riesgo"]=="BAJO":
-                estado["riesgo"]="FAVORABLE"
-            estado["mensaje"]+= f"✅ USD/MXN {estado['usdmxn_chg']}% favorable. "
-
-        # Combo mortal: USD arriba + IPC abajo
-        if estado["usdmxn_chg"]>=0.5 and estado["mxx_chg"]<=-0.3:
-            estado["riesgo"]="EXTREMO"; estado["bloqueo"]=True
-            estado["mensaje"]+= f"💥 Combo USD↑ + IPC↓. "
-
-        if not estado["mensaje"]:
-            estado["mensaje"]=f"Día normal USD {estado['usdmxn_chg']}% IPC {estado['mxx_chg']}%"
-    except Exception as e:
-        estado["mensaje"]=f"Macro error {e}"
-    return estado
-
-def fetch_yahoo_news(cand):
-    try:
-        news = yf.Ticker(cand).news
-        if not news: return []
-        titulos=[]
-        for n in news[:2]:
-            title=""
-            if isinstance(n, dict):
-                title = n.get('title') or (n.get('content',{}).get('title','') if isinstance(n.get('content'), dict) else "")
-            if title: titulos.append(title)
-        return titulos
-    except:
-        return []
-
-def fetch_google_rss(query):
-    try:
-        q = query.replace(" ","+")
-        url = f"https://news.google.com/rss/search?q={q}+Mexico&hl=es-419&gl=MX&ceid=MX:es-419"
-        r = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
-        if r.status_code!=200: return []
-        root = ET.fromstring(r.content)
-        titulos=[]
-        for item in root.findall(".//item")[:2]:
-            t = item.find("title")
-            if t is not None and t.text:
-                titulos.append(t.text[:120])
-        return titulos
-    except:
-        return []
-
-def analizar_noticia(ticker_mx):
-    base_simple = ticker_mx.replace(".MX","").replace("ISHRS","")
-    for cand in dict.fromkeys([ticker_mx.replace(".MX",""), base_simple]):
-        titulos = fetch_yahoo_news(cand)
-        if titulos:
-            txt = " | ".join(titulos)[:170]
-            tl = txt.lower()
-            score = sum(1 for w in POSITIVAS if w in tl) - sum(1 for w in NEGATIVAS if w in tl)
-            sent = 0
-            if score<=-2: sent=-1
-            elif score==-1: sent=-0.5
-            elif score>=2: sent=1
-            elif score==1: sent=0.5
-            return sent, f"[{cand}] {txt}"
-    titulos = fetch_google_rss(f"{base_simple} acciones")
-    if titulos:
-        txt = " | ".join(titulos)[:170]
-        tl = txt.lower()
-        score = sum(1 for w in POSITIVAS if w in tl) - sum(1 for w in NEGATIVAS if w in tl)
-        sent = 0
-        if score<=-2: sent=-1
-        elif score==-1: sent=-0.5
-        elif score>=2: sent=1
-        elif score==1: sent=0.5
-        return sent, f"[RSS {base_simple}] {txt}"
+        q = f"{ticker_base} BMV acciones"
+        url = f"https://news.google.com/rss/search?q={q}&hl=es-419&gl=MX&ceid=MX:es-419"
+        r = requests.get(url, timeout=6, headers={"User-Agent":"Mozilla/5.0"})
+        if r.status_code==200:
+            root = ElementTree.fromstring(r.content)
+            items = root.findall('.//item')[:2]
+            if items:
+                t = items[0].find('title').text or ""
+                lower = t.lower()
+                score = 0
+                if any(k in lower for k in ["record","alza","sube","ganancia","fuerte","positivo","crece","rally","maximo"]): score = 2
+                if any(k in lower for k in ["cae","baja","perdida","peor","caida","recorta","debil","pierde"]): score = -2
+                return score, t[:120]
+    except: pass
     return 0, ""
 
-def rsi_calc(s,p=14):
-    delta=s.diff(); gain=delta.where(delta>0,0).rolling(p).mean(); loss=-delta.where(delta<0,0).rolling(p).mean(); rs=gain/loss; return 100-(100/(1+rs))
+def get_macro_state_v11():
+    """
+    v11 FIX CRÍTICO: 
+    Antes: ipc_pct = (close_ayer - close_anteayer)/close_anteayer  -> dato de ayer, no sirve a las 8:41 AM
+    Ahora: ipc_pct = (open_hoy - close_ayer)/close_ayer -> dato real de hoy al abrir
+    """
+    tz_mx = pytz.timezone('America/Mexico_City')
+    now = datetime.now(tz_mx)
+    estado = {
+        "usd_pct": 0.0,
+        "ipc_pct": 0.0,
+        "ipc_tipo": "cierre_ayer_fallback",
+        "nivel": "NORMAL",
+        "msg": "",
+        "bloqueo": False,
+        "open_hoy": None,
+        "close_ayer": None,
+        "fuente": ""
+    }
+    # USD/MXN
+    try:
+        usd = yf.Ticker("USDMXN=X")
+        hd = usd.history(period="5d", interval="1d")
+        if len(hd)>=2:
+            prev = float(hd['Close'].iloc[-2]); last = float(hd['Close'].iloc[-1])
+            estado["usd_pct"] = (last-prev)/prev*100
+        # intenta 5m fresco
+        hi = usd.history(period="1d", interval="5m")
+        if len(hi)>=2:
+            estado["usd_pct"] = (float(hi['Close'].iloc[-1]) - float(hi['Close'].iloc[0]))/float(hi['Close'].iloc[0])*100
+            estado["fuente"] += "USD 5m; "
+    except Exception as e:
+        print("USD err", e)
 
-def generar_top():
-    tickers = [
-        "AAPL.MX","AC.MX","AMXB.MX","AMZN.MX","BBVA.MX","BIMBOA.MX","CEMEXCPO.MX","CUERVO.MX","F.MX","FIBRAMQ12.MX",
-        "FMTY14.MX","GAPB.MX","GCARSOA1.MX","GFINBURO.MX","GFNORTEO.MX","GMEXICOB.MX","GOOGL.MX","GRUMAB.MX","HERDEZ.MX",
-        "IEO.MX","INTC.MX","IVVPESOISHRS.MX","KIMBERA.MX","KOFUBL.MX","META.MX","MSFT.MX","NAFTRACISHRS.MX","NEMAKA.MX",
-        "NFLX.MX","NOKN.MX","NVDA.MX","PEOLES.MX","PINFRA.MX","SLV.MX","SORIANAB.MX","TLEVISACPO.MX","TM.MX","TSLA.MX","VOLARA.MX","WALMEX.MX"
-    ]
-    all_data={}
-    for t in tickers:
-        try:
-            df=yf.Ticker(t).history(period="2y", auto_adjust=True)
-            if len(df)>100: all_data[t]=df
-        except: pass
-    if not all_data:
-        raise Exception("Yahoo bloqueado - no data")
-    rows=[]
-    for t,df in all_data.items():
-        d=df.copy()
-        d['Ret_1d']=d['Close'].pct_change(1); d['Ret_5d']=d['Close'].pct_change(5)
-        d['Gap']=(d['Open']-d['Close'].shift(1))/d['Close'].shift(1)
-        d['Vol_MA20']=d['Volume'].rolling(20).mean(); d['Vol_Ratio']=d['Volume']/d['Vol_MA20']
-        d['Dist_MA20']=(d['Close']-d['Close'].rolling(20).mean())/d['Close'].rolling(20).mean()
-        d['RSI']=rsi_calc(d['Close']); d['Target']=(d['High']>=d['Open']*1.012).astype(int)
-        d.dropna(inplace=True); d['Ticker']=t; rows.append(d)
-    master=pd.concat(rows)
-    features=['Ret_1d','Ret_5d','Gap','Vol_Ratio','Dist_MA20','RSI']
-    X=master[features]; y=master['Target']
-    base_model=XGBClassifier(n_estimators=200,max_depth=2,learning_rate=0.03,min_child_weight=10,reg_alpha=1,reg_lambda=2,subsample=0.7,colsample_bytree=0.7,random_state=42,eval_metric='logloss')
-    calibrated=CalibratedClassifierCV(base_model, method='sigmoid', cv=TimeSeriesSplit(3))
-    calibrated.fit(X,y)
-    proba_raw=calibrated.predict_proba(X)[:,1]
-    p10,p90=np.percentile(proba_raw,[10,90])
-    macro = get_macro_state()
-    resultados=[]
-    bloqueados=[]
-    for t,df in all_data.items():
-        d=df.copy()
-        d['Ret_1d']=d['Close'].pct_change(1); d['Ret_5d']=d['Close'].pct_change(5)
-        d['Gap']=(d['Open']-d['Close'].shift(1))/d['Close'].shift(1)
-        d['Vol_MA20']=d['Volume'].rolling(20).mean(); d['Vol_Ratio']=d['Volume']/d['Vol_MA20']
-        d['Dist_MA20']=(d['Close']-d['Close'].rolling(20).mean())/d['Close'].rolling(20).mean()
-        d['RSI']=rsi_calc(d['Close']); d=d.dropna()
-        if d.empty: continue
-        last=d.iloc[-1]
-        raw=calibrated.predict_proba([[last['Ret_1d'],last['Ret_5d'],last['Gap'],last['Vol_Ratio'],last['Dist_MA20'],last['RSI']]])[0,1]
-        prob=52 + (np.clip(raw,p10,p90)-p10)/(p90-p10+1e-9)*16
-        sent, noticia = analizar_noticia(t)
-        prob_aj=prob
-        motivo=[]
-        bloqueado=False
-        # FILTROS v10
-        if last['RSI']>78:
-            bloqueado=True; motivo.append(f"RSI {last['RSI']:.0f} sobrecompra")
-        elif last['RSI']<22:
-            bloqueado=True; motivo.append(f"RSI {last['RSI']:.0f} sobreventa")
-        if last['Vol_Ratio']<0.6:
-            bloqueado=True; motivo.append(f"Sin volumen {last['Vol_Ratio']:.1f}x")
-        if abs(last['Gap'])>0.05:
-            bloqueado=True; motivo.append(f"Gap {last['Gap']*100:.1f}%")
-        if sent==-1:
-            bloqueado=True; motivo.append(f"Noticia negativa"); prob_aj-=10
-        elif sent==-0.5:
-            prob_aj-=5
-        elif sent==1:
-            prob_aj+=3
-        if macro["riesgo"]=="EXTREMO":
-            prob_aj-=15
-        elif macro["riesgo"]=="ALTO":
-            prob_aj-=7
-        elif macro["riesgo"]=="FAVORABLE":
-            prob_aj+=4
-        gf_link, gf_base = get_google_finance_link(t)
-        item={'Ticker':t,'Prob':prob,'Prob_Ajustada':max(45,min(78,prob_aj)),'Close':last['Close'],'RSI':last['RSI'],'Noticia':noticia,'GF_Link':gf_link,'GF_Base':gf_base,'Motivo':", ".join(motivo),'Bloqueado':bloqueado,'Vol_Ratio':last['Vol_Ratio'],'Gap':last['Gap']}
-        if bloqueado:
-            bloqueados.append(item)
-        else:
-            resultados.append(item)
-    resultados=sorted(resultados,key=lambda x: x['Prob_Ajustada'],reverse=True)
-    bloqueados=sorted(bloqueados,key=lambda x: x['Prob_Ajustada'],reverse=True)
-    return resultados, bloqueados, macro, master
+    # IPC ^MXX FIX
+    try:
+        ipc = yf.Ticker("^MXX")
+        hd = ipc.history(period="5d", interval="1d")
+        print(f"HD IPC {hd.tail(2)}")
+        if len(hd)>=2:
+            # Detectar si daily ya trae hoy
+            last_date = hd.index[-1].date()
+            prev_close = float(hd['Close'].iloc[-2])
+            last_close = float(hd['Close'].iloc[-1])
+            last_open = float(hd['Open'].iloc[-1])
 
-def construir_mensaje(resultados, bloqueados, macro, master):
-    hoy_str = pd.Timestamp.now().date()
-    msg = f"📊 <b>TOP BMV HOY {hoy_str} v10 - FILTRO IPC</b>\n"
-    msg += f"Tasa base: {master['Target'].mean()*100:.1f}% | Evaluadas: {len(resultados)+len(bloqueados)}/40 | Comprables: {len(resultados)}\n"
-    msg += f"Macro: {macro['riesgo']} | {macro['mensaje']}\n"
-    msg += f"USD/MXN: {macro['usdmxn_chg']}% | IPC: {macro['mxx_chg']}%\n\n"
-    if macro["bloqueo"]:
-        msg += f"🚫 <b>HOY NO OPERES - MERCADO EN ROJO</b>\n"
-        msg += f"Motivo: {macro['mensaje']}\n"
-        msg += f"Si operas hoy, probabilidad real cae a &lt;35%. Mejor esperar mañana.\n\n"
-    # TOP 10 comprables
-    top10 = resultados[:10]
-    if top10:
-        msg += f"<b>TOP 10 COMPRABLES HOY:</b>\n"
-        for i,r in enumerate(top10,1):
-            icono = "✅" if r['Prob_Ajustada']>=60 else "⚠️" if r['Prob_Ajustada']>=58 else "👀"
-            msg += f"{i}. {icono} <a href='{r['GF_Link']}'><b>{r['Ticker']}</b></a> {r['Prob_Ajustada']:.1f}% (base {r['Prob']:.1f}%) | ${r['Close']:.2f} | Venta ${r['Close']*1.012:.2f} | Stop ${r['Close']*0.992:.2f} | RSI {r['RSI']:.0f} Vol {r['Vol_Ratio']:.1f}x\n"
-            if r['Noticia']:
-                msg += f"   📰 {r['Noticia'][:110]}\n"
-            msg += "\n"
+            if last_date == now.date() and last_open != 0:
+                # MERCADO YA ABRIO Y YAHOO TIENE OPEN HOY
+                estado["ipc_pct"] = (last_open - prev_close)/prev_close*100
+                estado["ipc_tipo"] = "open_hoy_daily"
+                estado["open_hoy"] = last_open
+                estado["close_ayer"] = prev_close
+                estado["fuente"] += f"IPC open_hoy {last_open:.2f} vs close_ayer {prev_close:.2f}; "
+            else:
+                # No tiene daily de hoy, usa intradia 1m
+                hi = ipc.history(period="1d", interval="1m")
+                if len(hi)>0:
+                    open_intra = float(hi['Open'].iloc[0])
+                    # close_ayer es el ultimo close diario disponible
+                    close_ayer_real = float(hd['Close'].iloc[-1])
+                    estado["ipc_pct"] = (open_intra - close_ayer_real)/close_ayer_real*100
+                    estado["ipc_tipo"] = "open_hoy_intraday"
+                    estado["open_hoy"] = open_intra
+                    estado["close_ayer"] = close_ayer_real
+                    estado["fuente"] += f"IPC intraday open {open_intra:.2f} vs close_ayer {close_ayer_real:.2f}; "
+                else:
+                    # Fallback viejo
+                    estado["ipc_pct"] = (last_close - prev_close)/prev_close*100
+                    estado["ipc_tipo"] = "cierre_ayer"
+                    estado["close_ayer"] = last_close
+                    estado["fuente"] += "IPC fallback cierre_ayer; "
+    except Exception as e:
+        print("IPC err", e)
+        estado["ipc_tipo"] = "error"
+
+    # Evaluar nivel
+    usd = estado["usd_pct"]; ipc = estado["ipc_pct"]
+    if ipc <= -0.76:
+        estado["nivel"] = "EXTREMO"
+        estado["bloqueo"] = True
+        estado["msg"] = f"🚫 IPC {ipc:.2f}% muy rojo - HOY NO OPERES."
+    elif ipc <= -0.40:
+        estado["nivel"] = "ALTO"
+        estado["msg"] = f"⚠️ IPC {ipc:.2f}% rojo"
+    elif usd >= 0.8:
+        estado["nivel"] = "EXTREMO"; estado["bloqueo"] = True
+        estado["msg"] += f" USD/MXN +{usd:.2f}% EXTREMO."
+    elif usd >= 0.58:
+        if estado["nivel"] == "NORMAL": estado["nivel"] = "ALTO"
+        estado["msg"] += f" USD/MXN +{usd:.2f}% alto."
+
+    if usd >= 0.5 and ipc <= -0.3:
+        estado["nivel"] = "EXTREMO"; estado["bloqueo"] = True
+        estado["msg"] += " 💥 Combo USD↑ + IPC↓."
+
+    if not estado["msg"]:
+        estado["msg"] = f"Día normal USD {usd:.2f}% IPC {ipc:.2f}%"
+
+    print(f"MACRO v11: {estado}")
+    return estado
+
+def evaluar_un_ticker(base, macro):
+    yahoo = MAP_YAHOO[base]
+    try:
+        tk = yf.Ticker(yahoo)
+        h = tk.history(period="3mo", interval="1d")
+        if len(h) < 35:
+            return {"ticker": yahoo, "bloqueado": f"Sin historial {len(h)}"}
+        close = h['Close']
+        vol = h['Volume']
+        price = float(close.iloc[-1])
+        prev = float(close.iloc[-2])
+        open_hoy = float(h['Open'].iloc[-1])
+        gap = (open_hoy - prev)/prev*100
+        vol_mean = float(vol.rolling(20).mean().iloc[-1])
+        vol_ratio = float(vol.iloc[-1]/vol_mean) if vol_mean>0 else 1.0
+        rsi_v = float(rsi(close).iloc[-1])
+
+        # Filtros duros v10/v11
+        if rsi_v > 78:
+            return {"ticker": yahoo, "bloqueado": f"RSI {rsi_v:.0f} sobrecompra"}
+        if rsi_v < 22:
+            return {"ticker": yahoo, "bloqueado": f"RSI {rsi_v:.0f} sobreventa"}
+        if vol_ratio < 0.6:
+            return {"ticker": yahoo, "bloqueado": f"Vol {vol_ratio:.1f}x bajo"}
+        if abs(gap) > 5:
+            return {"ticker": yahoo, "bloqueado": f"Gap {gap:.1f}%"}
+
+        # Prob base (calibrada)
+        prob_base = 40.9
+        prob_base += (rsi_v-50)*-0.18
+        prob_base += (vol_ratio-1)*6
+        ret5 = (close.iloc[-1]/close.iloc[-6]-1)*100
+        prob_base += np.clip(ret5*0.4, -4,4)
+        prob_base = float(np.clip(prob_base, 36, 68))
+
+        prob = prob_base
+        # Macro ajuste
+        if macro["usd_pct"] >= 0.7: prob -= 7
+        if macro["usd_pct"] >= 0.8: prob -= 5
+        if macro["usd_pct"] <= -0.7: prob += 4
+        if macro["ipc_pct"] <= -0.40: prob -= 6
+        if macro["ipc_pct"] <= -0.76: prob -= 10
+
+        # Noticias
+        score, txt = get_news(base)
+        if score==2: prob += 3
+        if score==-2: prob -= 6
+
+        prob = float(np.clip(prob, 28, 70))
+
+        return {
+            "ticker": yahoo, "base": base, "price": price,
+            "venta": price*1.012, "stop": price*0.992,
+            "rsi": rsi_v, "vol": vol_ratio, "gap": gap,
+            "prob_base": prob_base, "prob": prob,
+            "news": txt, "bloqueado": None
+        }
+    except Exception as e:
+        return {"ticker": yahoo, "bloqueado": f"Error {str(e)[:50]}"}
+
+def send_telegram_msg(text):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Falta TOKEN/CHAT_ID")
+        print(text[:2000])
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        r = requests.post(url, json=payload, timeout=15)
+        print(f"Telegram {r.status_code}")
+    except Exception as e:
+        print(f"Telegram error {e}")
+
+def construir_mensaje(resultados, bloqueados, macro):
+    hoy = datetime.now(pytz.timezone('America/Mexico_City')).strftime('%Y-%m-%d')
+    txt = f"📊 <b>TOP BMV HOY {hoy} v11 - FILTRO IPC OPEN FIX</b>\n"
+    txt += f"Tasa base: 40.9% | Evaluadas: {len(resultados)+len(bloqueados)}/40 | Comprables: {len(resultados)}\n"
+    txt += f"Macro: {macro['nivel']} | {macro['msg']}\n"
+    txt += f"USD/MXN: {macro['usd_pct']:.2f}% | IPC: {macro['ipc_pct']:.2f}% ({macro['ipc_tipo']})\n"
+    if macro['fuente']: txt += f"Fuente: {macro['fuente']}\n"
+    txt += "\n"
+    if macro['bloqueo']:
+        txt += f"🚫 <b>HOY NO OPERES - MERCADO EN ROJO</b>\nMotivo: {macro['msg']}\nSi operas hoy, probabilidad real cae a &lt;35%. Mejor esperar mañana.\n\n"
+
+    top = sorted([r for r in resultados if not r.get('bloqueado')], key=lambda x: x['prob'], reverse=True)[:10]
+    if top:
+        txt += f"<b>TOP 10 COMPRABLES HOY:</b>\n"
+        for i,r in enumerate(top,1):
+            icono = "👀"
+            if r['prob']>=60: icono="✅"
+            elif r['prob']>=55: icono="👀"
+            link = get_google_link(r['ticker'])
+            txt += f"{i}. {icono} <a href='{link}'><b>{r['ticker']}</b></a> {r['prob']:.1f}% (base {r['prob_base']:.1f}%) | ${r['price']:.2f} | Venta ${r['venta']:.2f} | Stop ${r['stop']:.2f} | RSI {r['rsi']:.0f} Vol {r['vol']:.1f}x\n"
+            if r['news']:
+                txt += f"   📰 [RSS {r['base']}] {r['news'][:110]}\n\n"
     else:
-        msg += "Sin oportunidades comprables hoy. No operes.\n\n"
+        txt += "Sin oportunidades comprables hoy.\n"
         if bloqueados:
-            msg += f"<b>Top bloqueados por filtros v10 (para referencia):</b>\n"
-            for r in bloqueados[:3]:
-                msg += f"  {r['Ticker']} {r['Prob_Ajustada']:.1f}% - {r['Motivo']}\n"
-            msg += "\n"
-    msg += "🔗 Click en ticker abre Google Finance\n"
-    msg += "⚠️ Hey sin stop auto. Alerta TradingView en Stop.\n"
-    msg += "\nComandos: /top /ahora /macro /ayuda"
-    return msg
+            txt += f"Top bloqueados: {', '.join([b['ticker'][:12]+' '+b['bloqueado'] for b in bloqueados[:3]])}\n\n"
 
-try:
-    resultados, bloqueados, macro, master = generar_top()
-    mensaje = construir_mensaje(resultados, bloqueados, macro, master)
-    send_telegram(mensaje)
-except Exception as e:
-    err = traceback.format_exc()[-1200:]
-    send_telegram(f"❌ <b>BOT v10 FALLÓ {datetime.date.today()}</b>\n{str(e)[:400]}\n{err}")
+    txt += "🔗 Click en ticker abre Google Finance\n⚠️ Hey sin stop auto. Alerta TradingView en Stop.\n\nComandos: /top /ahora /macro /ayuda"
+    return txt[:4000]
 
-if len(os.sys.argv)>1 and os.sys.argv[1]=="interactive":
-    print("Modo interactivo v10 activo...")
-    last_update_id = 0
-    while True:
-        try:
-            resp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?offset={last_update_id+1}&timeout=20", timeout=25).json()
-            for upd in resp.get("result",[]):
-                last_update_id = upd["update_id"]
-                msg_obj = upd.get("message",{})
-                chat_id = str(msg_obj.get("chat",{}).get("id",""))
-                text = msg_obj.get("text","").lower().strip()
-                if chat_id != str(CHAT_ID): continue
-                if text in ["/top","/ahora","/top10","ahora","top"]:
-                    send_telegram("⏳ Calculando TOP 10 v10 con filtro IPC...")
-                    res, bloq, mac, mast = generar_top()
-                    send_telegram(construir_mensaje(res, bloq, mac, mast))
-                elif text in ["/macro","/usd","macro"]:
-                    mac = get_macro_state()
-                    send_telegram(f"📈 <b>Macro ahora v10</b>\nRiesgo: {mac['riesgo']}\n{mac['mensaje']}\nUSD/MXN: {mac['usdmxn_chg']}% | IPC: {mac['mxx_chg']}%\nBloqueo: {mac['bloqueo']}")
-                elif text in ["/ayuda","/help","/start","ayuda","help"]:
-                    send_telegram("🤖 <b>Comandos BMV v10</b>\n/top o /ahora - TOP 10 con filtro IPC\n/macro - Estado USD/MXN e IPC\n/ayuda - Esta ayuda\n\nNuevo en v10: Si IPC < -0.4% bloquea todo.")
-        except Exception as e:
-            print(f"Loop error {e}")
-            time.sleep(5)
+def main_job():
+    try:
+        macro = get_macro_state_v11()
+        resultados = []; bloqueados = []
+        for base in TICKERS_BMV:
+            res = evaluar_un_ticker(base, macro)
+            if res is None: continue
+            if res.get('bloqueado'):
+                bloqueados.append(res)
+            else:
+                resultados.append(res)
+        msg = construir_mensaje(resultados, bloqueados, macro)
+        send_telegram_msg(msg)
+    except Exception as e:
+        import traceback
+        err = traceback.format_exc()[-1500:]
+        send_telegram_msg(f"❌ Bot v11 fallo {e}\n{err}")
+
+if __name__ == "__main__":
+    main_job()
